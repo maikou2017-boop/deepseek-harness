@@ -1,0 +1,98 @@
+name: MCore DSH Gate 0 Evidence
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - .github/workflows/mcore-gate0-evidence.yml
+      - mcore/evidence/gate0/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcore-dsh-gate0-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PINNED_DSH_SHA: b150a551b8d465e31e418e1b2eaf5e79bbb7d28e
+  DSH_TOOLS_MODE: native
+
+jobs:
+  evidence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact review head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify upstream source remains pinned and untouched
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git merge-base HEAD "$PINNED_DSH_SHA")" = "$PINNED_DSH_SHA"
+          unexpected="$(git diff --name-only "$PINNED_DSH_SHA"..HEAD | grep -Ev '^(\.github/workflows/mcore-gate0-evidence\.yml|mcore/evidence/gate0/)' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Unexpected upstream source changes:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.20.0
+          cache: pnpm
+
+      - name: Activate pinned pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.7.0 --activate
+          node --version
+          npm --version
+          pnpm --version
+
+      - name: Install exact locked dependencies without lifecycle scripts
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Generate reviewer-safe Gate 0 package
+        run: node mcore/evidence/gate0/generate-evidence.mjs
+
+      - name: Validate evidence package
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_dir="$(find mcore-evidence -maxdepth 1 -type d -name 'gate0-*' | head -n 1)"
+          test -n "$evidence_dir"
+          test -f "$evidence_dir/pinned-version-manifest.json"
+          test -f "$evidence_dir/sbom.minimal.json"
+          test -f "$evidence_dir/reproduce-rollback.md"
+          test -f "$evidence_dir/review-summary.md"
+          test -f "$evidence_dir/evidence-index.json"
+          test -f "$evidence_dir/evidence-index.sha256"
+          grep -q 'REVIEW_PENDING' "$evidence_dir/pinned-version-manifest.json"
+          grep -q '"toolsMode": "native"' "$evidence_dir/pinned-version-manifest.json"
+          sha256sum -c "$evidence_dir/evidence-index.sha256"
+
+      - name: Publish evidence summary
+        shell: bash
+        run: |
+          evidence_dir="$(find mcore-evidence -maxdepth 1 -type d -name 'gate0-*' | head -n 1)"
+          cat "$evidence_dir/review-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo '## Evidence index' >> "$GITHUB_STEP_SUMMARY"
+          cat "$evidence_dir/evidence-index.sha256" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reviewer-safe evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcore-dsh-gate0-evidence-${{ github.run_id }}
+          path: mcore-evidence/gate0-*
+          if-no-files-found: error
+          retention-days: 30
